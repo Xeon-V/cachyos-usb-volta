@@ -15,11 +15,11 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 [[ $EUID -eq 0 ]] || error "Run as root: sudo bash $0"
 
 # Check deps
-missing=()
+missing=""
 for cmd in unsquashfs mksquashfs lsblk mount umount findmnt cp dd xorriso; do
-    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
 done
-[[ ${#missing[@]} -eq 0 ]] || error "Missing: ${missing[*]}"
+[ -z "$missing" ] || error "Missing:$missing"
 
 # =============================================================================
 # STEP 1: INDEX SYSTEM
