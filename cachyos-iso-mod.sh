@@ -1,9 +1,14 @@
 #!/bin/bash
 # ============================================================================
-# CachyOS ISO Modifier - Volta/Titan V Edition (systemd-boot support)
+# CachyOS ISO Modifier - Volta/Titan V Edition (GCC + CUDA + Driver Lock)
 # ============================================================================
-# Handles both traditional efiboot.img ISOs AND systemd-boot ISOs
-# (which use shellx64.efi + initramfs directly).
+# Auto-installs missing dependencies, indexes system, modifies CachyOS Live ISO.
+# Forces NVIDIA 580xx, pins CUDA 12.9, pins GCC, guides PyTorch cu126.
+#
+# USAGE:
+#   sudo bash cachyos-iso-mod.sh              # auto-finds cachyos*.iso
+#   sudo bash cachyos-iso-mod.sh --out ~/Desktop/
+#   sudo bash cachyos-iso-mod.sh --iso custom.iso --out ~/Desktop/
 # ============================================================================
 set -euo pipefail
 
@@ -127,13 +132,13 @@ else
 fi
 
 # =============================================================================
-# STEP 1: INDEX SYSTEM
+# STEP 1: INDEX SYSTEM (INCLUDING GCC STATE)
 # =============================================================================
 step "System Index"
 
 WORK_DIR=$(mktemp -d /tmp/cachy-iso-mod.XXXXXX)
 SNAPSHOT="$WORK_DIR/snapshot"
-mkdir -p "$SNAPSHOT"/{pacman,pip,system,gpu}
+mkdir -p "$SNAPSHOT"/{pacman,pip,system,gpu,cuda}
 
 info "Scanning hardware..."
 if command -v nvidia-smi &>/dev/null; then
@@ -160,10 +165,22 @@ except Exception as e:
 print(json.dumps(data, indent=2))
 " > "$SNAPSHOT/gpu/pytorch.json" 2>/dev/null || true
 
+info "Capturing GCC state..."
+gcc --version > "$SNAPSHOT/system/gcc-version.txt" 2>/dev/null || true
+g++ --version > "$SNAPSHOT/system/g++-version.txt" 2>/dev/null || true
+
+# Capture kernel build GCC
+if [[ -f /proc/version ]]; then
+    cat /proc/version > "$SNAPSHOT/system/kernel-build-info.txt"
+fi
+
 info "Exporting packages..."
 pacman -Qqen > "$SNAPSHOT/pacman/explicit.txt"
 pacman -Qqm  > "$SNAPSHOT/pacman/foreign.txt" 2>/dev/null || true
 pacman -Q    > "$SNAPSHOT/pacman/all-versions.txt"
+
+# Capture GCC-related packages specifically
+grep -E "^gcc|^gcc-libs|^gcc-" "$SNAPSHOT/pacman/all-versions.txt" > "$SNAPSHOT/cuda/gcc-packages.txt" 2>/dev/null || true
 
 for pybin in python3 python pip pip3; do
     if command -v "$pybin" &>/dev/null; then
@@ -254,7 +271,7 @@ CHWDEOF
 ok "Injected custom-volta-nvidia-580xx (priority 9999)"
 
 # =============================================================================
-# STEP 7: POST-INSTALL SCRIPT
+# STEP 7: POST-INSTALL SCRIPT (WITH GCC PINNING)
 # =============================================================================
 step "Creating Post-Install Script"
 
@@ -269,12 +286,14 @@ echo "=========================================="
 echo "  CachyOS Volta/Titan V Post-Install"
 echo "=========================================="
 
+# --- NVIDIA Driver ----------------------------------------------------------
 echo "[*] Removing conflicting drivers..."
 pacman -Rdd --noconfirm linux-cachyos-nvidia-open linux-cachyos-lts-nvidia-open 2>/dev/null || true
 
 echo "[*] Installing forced 580xx profile..."
 chwd -a -f || true
 
+# --- Pacman Packages --------------------------------------------------------
 if [[ -f /root/snapshot/pacman/explicit.txt ]]; then
     count=$(wc -l < /root/snapshot/pacman/explicit.txt)
     echo "[*] Installing $count explicit packages..."
@@ -283,6 +302,7 @@ if [[ -f /root/snapshot/pacman/explicit.txt ]]; then
     }
 fi
 
+# --- Restore Configs (merge-only) ------------------------------------------
 if [[ -f /root/snapshot/system/pacman.conf ]]; then
     echo "[*] Merging custom repositories..."
     grep -E '^\[.*\]' /root/snapshot/system/pacman.conf | while read -r repo_line; do
@@ -296,11 +316,22 @@ if [[ -f /root/snapshot/system/pacman.conf ]]; then
     done
 fi
 
-echo "[*] Pinning CUDA packages..."
-IGNORE_PKGS="cuda cuda-tools cudnn"
+# --- GCC PINNING (Critical for DKMS + CUDA) --------------------------------
+echo "[*] Pinning GCC for DKMS/CUDA compatibility..."
+# DKMS builds kernel modules using the CURRENT system's GCC.
+# If GCC upgrades but kernel was built with older GCC, DKMS fails.
+# CUDA nvcc also has max GCC version limits.
+# We pin gcc, gcc-libs, and kernel headers to prevent breakage.
+
+GCC_IGNORE="gcc gcc-libs gcc-fortran gcc-ada gcc-objc gcc-go gcc-d"
+CUDA_IGNORE="cuda cuda-tools cudnn"
+KERNEL_IGNORE="linux-cachyos-headers linux-cachyos-lts-headers"
+
+ALL_IGNORE="$GCC_IGNORE $CUDA_IGNORE $KERNEL_IGNORE"
+
 if grep -q "^IgnorePkg" /etc/pacman.conf 2>/dev/null; then
     existing=$(grep "^IgnorePkg" /etc/pacman.conf)
-    for pkg in $IGNORE_PKGS; do
+    for pkg in $ALL_IGNORE; do
         if ! echo "$existing" | grep -q "$pkg"; then
             sed -i "s/^IgnorePkg.*/& $pkg/" /etc/pacman.conf
             echo "    -> Added $pkg"
@@ -308,13 +339,23 @@ if grep -q "^IgnorePkg" /etc/pacman.conf 2>/dev/null; then
     done
 else
     if grep -q "^#IgnorePkg" /etc/pacman.conf; then
-        sed -i '/^#IgnorePkg/a IgnorePkg   = cuda cuda-tools cudnn' /etc/pacman.conf
+        sed -i "/^#IgnorePkg/a IgnorePkg   = $ALL_IGNORE" /etc/pacman.conf
     else
-        sed -i '/^\[options\]/a IgnorePkg   = cuda cuda-tools cudnn' /etc/pacman.conf
+        sed -i "/^\[options\]/a IgnorePkg   = $ALL_IGNORE" /etc/pacman.conf
     fi
     echo "    -> Created IgnorePkg entry"
 fi
 
+# --- Hold specific GCC version if detected in snapshot -----------------------
+if [[ -f /root/snapshot/system/gcc-version.txt ]]; then
+    echo ""
+    echo "[*] Snapshot GCC version:"
+    head -1 /root/snapshot/system/gcc-version.txt
+    echo "    To install this exact GCC version if needed:"
+    echo "    sudo pacman -U /var/cache/pacman/pkg/gcc-<version>-x86_64.pkg.tar.zst"
+fi
+
+# --- Python/PyTorch Environment ---------------------------------------------
 echo ""
 echo "[*] Python Environment:"
 if [[ -f /root/snapshot/pip/pip-freeze.txt ]]; then
@@ -324,13 +365,35 @@ echo "    For Volta/Titan V:"
 echo "      pip install torch --index-url https://download.pytorch.org/whl/cu126"
 echo "    (PyTorch 2.11+ cu128/cu129 drops sm_70)"
 
+if [[ -f /root/snapshot/conda/environment.yml ]]; then
+    echo "    conda env: /root/snapshot/conda/environment.yml"
+fi
+
+# --- GPU Verification -------------------------------------------------------
 echo ""
 echo "[*] GPU Status:"
 nvidia-smi -L 2>/dev/null || echo "    nvidia-smi not available until reboot"
 
+# --- Volta Warning ----------------------------------------------------------
 echo ""
 echo "=========================================="
-echo "  Done. Reboot when ready."
+echo "  VOLTA/TITAN V COMPATIBILITY LOCK"
+echo "=========================================="
+echo "  Driver:     nvidia-580xx (legacy branch)"
+echo "  CUDA:       12.9 pinned (blocks 13.x)"
+echo "  GCC:        PINNED (prevents DKMS breakage)"
+echo "  Kernel:     PINNED (headers locked)"
+echo "  PyTorch:    ONLY cu126 wheels"
+echo ""
+echo "  WARNING: Do NOT run 'pacman -S gcc' or kernel upgrades"
+echo "           without checking DKMS compatibility first!"
+echo ""
+echo "  To check before upgrading:"
+echo "    gcc --version"
+echo "    cat /proc/version"
+echo "    dkms status"
+echo ""
+echo "  Post-install complete. Reboot when ready."
 echo "=========================================="
 EOF
 
@@ -340,7 +403,7 @@ mkdir -p "$SQUASH/usr/share/applications"
 cat > "$SQUASH/usr/share/applications/cachy-post-install.desktop" << 'EOF'
 [Desktop Entry]
 Name=Run Volta Post-Install
-Comment=Apply NVIDIA 580xx + custom packages for Titan V
+Comment=Apply NVIDIA 580xx + GCC/CUDA lock for Titan V
 Exec=konsole -e /usr/local/bin/cachy-post-install
 Type=Application
 Terminal=true
@@ -363,7 +426,7 @@ rm -f "$AIROOTFS"
 spinner $! "Repacking squashfs..."
 
 # =============================================================================
-# STEP 9: REBUILD ISO (FIXED BOOT DETECTION)
+# STEP 9: REBUILD ISO (DYNAMIC BOOT DETECTION)
 # =============================================================================
 step "Rebuilding Bootable ISO"
 
@@ -375,23 +438,14 @@ else
     NEW_ISO="$(dirname "$ISO_IN")/$NEW_ISO_NAME"
 fi
 
-# --- Detect Boot Structure (FIXED for systemd-boot) ---
 XORSISO_ARGS=()
 
 info "Analyzing boot structure..."
 
-# Check if this is a systemd-boot ISO (shellx64.efi at root)
 if [[ -f "$ISO_COPY/shellx64.efi" ]]; then
     info "Detected systemd-boot ISO (shellx64.efi)"
-    # systemd-boot uses -e with the raw .efi file
-    # The initramfs images are in arch/boot/x86_64/
     XORSISO_ARGS+=(-eltorito-alt-boot -e shellx64.efi -no-emul-boot -isohybrid-gpt-basdat)
-
-    # For systemd-boot, we also need to ensure the arch/ directory is accessible
-    # No additional BIOS boot needed — systemd-boot handles both UEFI and BIOS via fallback
-
 elif [[ -f "$ISO_COPY/EFI/boot/efiboot.img" || -f "$ISO_COPY/efi/boot/efiboot.img" ]]; then
-    # Traditional efiboot.img container
     EFI_IMG=""
     for path in "$ISO_COPY/EFI/boot/efiboot.img" "$ISO_COPY/efi/boot/efiboot.img"; do
         [[ -f "$path" ]] && EFI_IMG="${path#$ISO_COPY/}" && break
@@ -399,12 +453,10 @@ elif [[ -f "$ISO_COPY/EFI/boot/efiboot.img" || -f "$ISO_COPY/efi/boot/efiboot.im
     info "Detected traditional EFI ISO (efiboot.img)"
     XORSISO_ARGS+=(-eltorito-alt-boot -e "$EFI_IMG" -no-emul-boot -isohybrid-gpt-basdat)
 else
-    # Fallback: search for any bootable EFI
     warn "Searching for boot files..."
     EFI_CANDIDATES=()
     while IFS= read -r -d '' path; do
         rel="${path#$ISO_COPY/}"
-        # Skip memtest and other non-boot EFI files
         [[ "$rel" =~ memtest ]] && continue
         [[ "$rel" =~ test ]] && continue
         EFI_CANDIDATES+=("$rel")
@@ -419,7 +471,6 @@ else
     fi
 fi
 
-# BIOS boot (isolinux) — optional
 if [[ -f "$ISO_COPY/isolinux/isolinux.bin" ]]; then
     XORSISO_ARGS+=(-eltorito-boot isolinux/isolinux.bin -eltorito-catalog isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table)
 
@@ -432,7 +483,6 @@ if [[ -f "$ISO_COPY/isolinux/isolinux.bin" ]]; then
     info "BIOS boot: isolinux"
 fi
 
-# Build
 (xorriso -as mkisofs \
     -iso-level 3 -full-iso9660-filenames -joliet -joliet-long -rational-rock \
     -volid "CACHYOS_VOLTA" \
@@ -444,7 +494,7 @@ spinner $! "Building ISO with xorriso..."
 ISO_SIZE=$(du -h "$NEW_ISO" | cut -f1)
 
 # =============================================================================
-# FIX: CHOWN OUTPUT TO USER (not root)
+# FIX: CHOWN OUTPUT TO USER
 # =============================================================================
 if [[ -f "$NEW_ISO" ]]; then
     USER_NAME="${SUDO_USER:-$USER}"
@@ -477,5 +527,7 @@ echo -e "    Or: ${YELLOW}sudo /usr/local/bin/cachy-post-install${NC}"
 echo ""
 echo -e "  ${BOLD}Driver:${NC}  nvidia-580xx (chwd priority 9999)"
 echo -e "  ${BOLD}CUDA:${NC}    12.9 pinned via IgnorePkg"
+echo -e "  ${BOLD}GCC:${NC}     PINNED (prevents DKMS breakage)"
+echo -e "  ${BOLD}Kernel:${NC}   PINNED (headers locked)"
 echo -e "  ${BOLD}PyTorch:${NC} cu126 wheels only (last sm_70)"
 echo ""
