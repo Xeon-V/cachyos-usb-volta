@@ -426,7 +426,36 @@ rm -f "$AIROOTFS"
 spinner $! "Repacking squashfs..."
 
 # =============================================================================
-# STEP 9: REBUILD ISO (DYNAMIC BOOT DETECTION)
+# STEP 9: EXTRACT EFI PARTITION FROM ORIGINAL ISO
+# =============================================================================
+step "Extracting EFI Partition"
+
+info "Detecting EFI partition in original ISO..."
+EFI_PART="$WORK_DIR/efi_part.img"
+EFI_START=""
+EFI_SECTORS=""
+
+if command -v fdisk &>/dev/null; then
+    EFI_NUMS=$(fdisk -l "$ISO_IN" 2>/dev/null | grep "EFI" | grep -oE '[0-9]+' | tr '\n' ' ')
+    if [[ -n "$EFI_NUMS" ]]; then
+        read -r EFI_START _ EFI_SECTORS <<< "$EFI_NUMS"
+    fi
+fi
+
+# Fallback for CachyOS standard layout if detection fails
+[[ -z "$EFI_START" ]] && EFI_START=5931008
+[[ -z "$EFI_SECTORS" ]] && EFI_SECTORS=47104
+
+info "Extracting EFI partition (start=$EFI_START, sectors=$EFI_SECTORS)..."
+dd if="$ISO_IN" of="$EFI_PART" bs=512 skip="$EFI_START" count="$EFI_SECTORS" status=none 2>/dev/null || true
+if file "$EFI_PART" 2>/dev/null | grep -q "FAT"; then
+    ok "EFI partition extracted ($(du -h "$EFI_PART" | cut -f1)) — FAT filesystem verified"
+else
+    warn "EFI partition extracted but does not appear to be FAT — boot may fail"
+fi
+
+# =============================================================================
+# STEP 10: REBUILD ISO (HYBRID MBR+EFI+GPT)
 # =============================================================================
 step "Rebuilding Bootable ISO"
 
@@ -438,59 +467,43 @@ else
     NEW_ISO="$(dirname "$ISO_IN")/$NEW_ISO_NAME"
 fi
 
-XORSISO_ARGS=()
+# Build ISO matching original CachyOS hybrid boot structure exactly
+info "Building hybrid ISO with BIOS+UEFI support..."
 
-info "Analyzing boot structure..."
-
-if [[ -f "$ISO_COPY/shellx64.efi" ]]; then
-    info "Detected systemd-boot ISO (shellx64.efi)"
-    XORSISO_ARGS+=(-eltorito-alt-boot -e shellx64.efi -no-emul-boot -isohybrid-gpt-basdat)
-elif [[ -f "$ISO_COPY/EFI/boot/efiboot.img" || -f "$ISO_COPY/efi/boot/efiboot.img" ]]; then
-    EFI_IMG=""
-    for path in "$ISO_COPY/EFI/boot/efiboot.img" "$ISO_COPY/efi/boot/efiboot.img"; do
-        [[ -f "$path" ]] && EFI_IMG="${path#$ISO_COPY/}" && break
-    done
-    info "Detected traditional EFI ISO (efiboot.img)"
-    XORSISO_ARGS+=(-eltorito-alt-boot -e "$EFI_IMG" -no-emul-boot -isohybrid-gpt-basdat)
-else
-    warn "Searching for boot files..."
-    EFI_CANDIDATES=()
-    while IFS= read -r -d '' path; do
-        rel="${path#$ISO_COPY/}"
-        [[ "$rel" =~ memtest ]] && continue
-        [[ "$rel" =~ test ]] && continue
-        EFI_CANDIDATES+=("$rel")
-    done < <(find "$ISO_COPY" -maxdepth 2 -type f -iname "*.efi" -print0 2>/dev/null)
-
-    if [[ ${#EFI_CANDIDATES[@]} -gt 0 ]]; then
-        EFI_IMG="${EFI_CANDIDATES[0]}"
-        warn "Using EFI file: $EFI_IMG"
-        XORSISO_ARGS+=(-eltorito-alt-boot -e "$EFI_IMG" -no-emul-boot -isohybrid-gpt-basdat)
-    else
-        error "No bootable EFI file found in ISO"
-    fi
-fi
-
-if [[ -f "$ISO_COPY/isolinux/isolinux.bin" ]]; then
-    XORSISO_ARGS+=(-eltorito-boot isolinux/isolinux.bin -eltorito-catalog isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table)
-
-    ISOHDPFX=""
-    for path in /usr/lib/syslinux/bios/isohdpfx.bin /usr/share/syslinux/isohdpfx.bin; do
-        [[ -f "$path" ]] && ISOHDPFX="$path" && break
-    done
-    [[ -n "$ISOHDPFX" ]] || error "syslinux isohdpfx.bin not found"
-    XORSISO_ARGS+=(-isohybrid-mbr "$ISOHDPFX")
-    info "BIOS boot: isolinux"
-fi
-
-(xorriso -as mkisofs \
-    -iso-level 3 -full-iso9660-filenames -joliet -joliet-long -rational-rock \
+xorriso -as mkisofs \
+    -iso-level 3 \
+    -full-iso9660-filenames \
+    -joliet -joliet-long \
+    -rational-rock \
     -volid "CACHYOS_VOLTA" \
-    "${XORSISO_ARGS[@]}" \
-    -output "$NEW_ISO" "$ISO_COPY") &
-spinner $! "Building ISO with xorriso..."
+    -partition_offset 16 \
+    -partition_cyl_align off \
+    -isohybrid-mbr --interval:local_fs:0s-15s:zero_mbrpt,zero_gpt:"$ISO_IN" \
+    --mbr-force-bootable \
+    -c '/boot/syslinux/boot.cat' \
+    -b '/boot/syslinux/isolinux.bin' \
+    -no-emul-boot \
+    -boot-load-size 4 \
+    -boot-info-table \
+    -append_partition 2 0xef "$EFI_PART" \
+    -iso_mbr_part_type 0x00 \
+    -isohybrid-gpt-basdat \
+    -eltorito-alt-boot \
+    -e '--interval:appended_partition_2:all::' \
+    -no-emul-boot \
+    -output "$NEW_ISO" \
+    "$ISO_COPY" &
+spinner $! "Building hybrid ISO..."
 
 [[ -f "$NEW_ISO" ]] || error "ISO build failed — no output file"
+
+# Verify EFI boot entry exists in rebuilt ISO
+if xorriso -indev "$NEW_ISO" -report_el_torito as_mkisofs 2>/dev/null | grep -q "eltorito-alt-boot"; then
+    ok "EFI boot entry verified in rebuilt ISO"
+else
+    warn "EFI boot entry may be missing — ISO might be BIOS-only"
+fi
+
 ISO_SIZE=$(du -h "$NEW_ISO" | cut -f1)
 
 # =============================================================================
